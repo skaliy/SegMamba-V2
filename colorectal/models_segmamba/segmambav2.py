@@ -4,20 +4,37 @@ import torch
 from einops import rearrange
 from monai.networks.blocks.dynunet_block import UnetOutBlock
 from monai.networks.blocks.unetr_block import UnetrBasicBlock, UnetrUpBlock
-from mamba_ssm import Mamba
+
+
+def _build_mamba(backend, dim, d_state, d_conv, expand):
+    """Backend-selectable inner Mamba block.
+
+    The two backends share an identical parameter layout, so a checkpoint trained with
+    one loads into the other with strict=True (no remapping, no retraining).
+
+    - "mamba_ssm"  : original CUDA selective-scan kernel (GPU / training; unchanged).
+    - "mambamixer" : transformers.MambaMixer, runs slow_forward on CPU (weight-compatible).
+    """
+    if backend == "mamba_ssm":
+        from mamba_ssm import Mamba  # lazy: CUDA-only, imported only when this backend is used
+        return Mamba(d_model=dim, d_state=d_state, d_conv=d_conv, expand=expand)
+    if backend == "mambamixer":
+        from transformers import MambaConfig
+        from transformers.models.mamba.modeling_mamba import MambaMixer
+        # Remaining MambaConfig defaults already match mamba_ssm.Mamba (use_bias=False,
+        # use_conv_bias=True, hidden_act="silu", time_step_rank="auto" -> ceil(dim/16)), so the
+        # parameter layout is identical and a trained mamba_ssm checkpoint loads strict.
+        cfg = MambaConfig(hidden_size=dim, state_size=d_state, conv_kernel=d_conv, expand=expand)
+        return MambaMixer(cfg, layer_idx=0)
+    raise ValueError(f"unknown mamba backend: {backend!r}")
 
 
 class MambaLayer(nn.Module):
-    def __init__(self, dim, d_state = 16, d_conv = 4, expand = 2, num_slices=None):
+    def __init__(self, dim, d_state = 16, d_conv = 4, expand = 2, num_slices=None, backend="mamba_ssm"):
         super().__init__()
         self.dim = dim
         self.norm = nn.LayerNorm(dim)
-        self.mamba = Mamba(
-                d_model=dim, # Model dimension d_model
-                d_state=d_state,  # SSM state expansion factor
-                d_conv=d_conv,    # Local convolution width
-                expand=expand,    # Block expansion factor
-        )
+        self.mamba = _build_mamba(backend, dim, d_state, d_conv, expand)
     
     def mamba_forward(self, x):
         B, C = x.shape[:2]
@@ -161,7 +178,8 @@ class LargeKernelConv(nn.Module):
 
 class MambaEncoder(nn.Module):
     def __init__(self, in_chans=1, depths=[2, 2, 2, 2], dims=[48, 96, 192, 384],
-                 drop_path_rate=0., layer_scale_init_value=1e-6, out_indices=[0, 1, 2, 3]):
+                 drop_path_rate=0., layer_scale_init_value=1e-6, out_indices=[0, 1, 2, 3],
+                 mamba_backend="mamba_ssm"):
         super().__init__()
 
         self.downsample_layers = nn.ModuleList() # stem and 3 intermediate downsampling conv layers
@@ -190,7 +208,7 @@ class MambaEncoder(nn.Module):
                     *[LargeKernelConv(dims[i]) for j in range(depths[i])]
                 )
                 stage = nn.Sequential(
-                    *[MambaLayer(dim=dims[i]) for j in range(depths[i])]
+                    *[MambaLayer(dim=dims[i], backend=mamba_backend) for j in range(depths[i])]
                 )
 
             self.stages.append(stage)
@@ -242,6 +260,7 @@ class SegMamba(nn.Module):
         conv_block: bool = True,
         res_block: bool = True,
         spatial_dims=3,
+        mamba_backend: str = "mamba_ssm",
     ) -> None:
         super().__init__()
 
@@ -254,11 +273,12 @@ class SegMamba(nn.Module):
         self.layer_scale_init_value = layer_scale_init_value
 
         self.spatial_dims = spatial_dims
-        self.vit = MambaEncoder(in_chans, 
+        self.vit = MambaEncoder(in_chans,
                                 depths=depths,
                                 dims=feat_size,
                                 drop_path_rate=drop_path_rate,
                                 layer_scale_init_value=layer_scale_init_value,
+                                mamba_backend=mamba_backend,
                               )
         self.encoder1 = UnetrBasicBlock(
             spatial_dims=spatial_dims,
@@ -352,7 +372,7 @@ class SegMamba(nn.Module):
             norm_name=norm_name,
             res_block=res_block,
         )
-        self.out = UnetOutBlock(spatial_dims=spatial_dims, in_channels=48, out_channels=self.out_chans)
+        self.out = UnetOutBlock(spatial_dims=spatial_dims, in_channels=self.feat_size[0], out_channels=self.out_chans)
 
     def proj_feat(self, x):
         new_view = [x.size(0)] + self.proj_view_shape
