@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "segmamba-v2"
+version = "0.1.0"
+description = "SegMamba-V2 segmentation model with a CPU-capable Mamba backend (fork of ge-xing/SegMamba-V2)"
+requires-python = ">=3.10"
+# torch is intentionally NOT pinned here: install the torch build appropriate for your platform first.
+dependencies = ["einops", "monai"]
+
+[project.optional-dependencies]
+cpu = ["transformers"]                  # MambaMixer backend  -> mamba_backend="mambamixer"
+gpu = ["mamba-ssm", "causal-conv1d"]    # default CUDA backend -> mamba_backend="mamba_ssm"
+
+[tool.setuptools]
+# Package only the model (colorectal/models_segmamba), not the training scripts.
+package-dir = {"" = "colorectal"}
+packages = ["models_segmamba"]
